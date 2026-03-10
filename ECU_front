@@ -1,0 +1,165 @@
+#include <Arduino.h>
+#include <CAN.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+
+// --- PIN CONFIGURATION ---
+#define TX_PIN 21
+#define RX_PIN 22
+#define PIN_TRIG 18
+#define PIN_ECHO 19
+#define PIN_TEMP 4      
+#define PIN_FARURI    13    // Headlights
+#define PIN_SEMNAL_ST 32    // Left Turn Signal
+#define PIN_SEMNAL_DR 33    // Right Turn Signal
+
+OneWire oneWire(PIN_TEMP);
+DallasTemperature sensors(&oneWire);
+
+// --- GLOBAL VARIABLES ---
+unsigned long lastDistTime = 0;
+unsigned long lastTempTime = 0;
+int tempDeTrimis = 0; 
+
+// Signaling & Hazard Variables
+unsigned long lastBlinkTime = 0;
+int blinkCounterStanga = 0; 
+int blinkCounterDreapta = 0; 
+bool stareLedStanga = false;
+bool stareLedDreapta = false;
+bool modAvarii = false; // Emergency/Hazard state flag
+#define VITEZA_SEMNAL 400 
+
+
+
+void setup() {
+  Serial.begin(115200);
+  
+  pinMode(PIN_FARURI, OUTPUT);
+  pinMode(PIN_SEMNAL_ST, OUTPUT);
+  pinMode(PIN_SEMNAL_DR, OUTPUT);
+  pinMode(PIN_TRIG, OUTPUT);
+  pinMode(PIN_ECHO, INPUT);
+
+  // Initialize Temperature Sensor
+  sensors.begin();
+  sensors.setWaitForConversion(false); // Non-blocking mode
+  sensors.requestTemperatures(); 
+
+  // Initialize CAN Bus at 500kbps
+  CAN.setPins(RX_PIN, TX_PIN);
+  if (!CAN.begin(500E3)) { 
+    Serial.println("CAN Initialization Failed!"); 
+    while(1); 
+  }
+  Serial.println("Front Node Started - Hazard Mode Ready");
+}
+
+void loop() {
+  // 1. LISTEN FOR INCOMING CAN COMMANDS (Lights & States)
+  int packetSize = CAN.parsePacket();
+  if (packetSize) {
+    if (CAN.packetId() == 0x01) { // Master Controller ID
+      int comanda = CAN.read();
+      
+      // Special Command 99: Activate Hazard/Emergency Mode
+      if (comanda == 99) {
+        modAvarii = true;
+      } 
+      else {
+        // Any other command disables Hazard Mode and resets light states
+        if (modAvarii) {
+          modAvarii = false;
+          digitalWrite(PIN_FARURI, LOW);
+          digitalWrite(PIN_SEMNAL_ST, LOW);
+          digitalWrite(PIN_SEMNAL_DR, LOW);
+        }
+
+        // Standard Lighting Logic
+        if (comanda == 10) digitalWrite(PIN_FARURI, HIGH);      // Headlights ON
+        else if (comanda == 11) digitalWrite(PIN_FARURI, LOW);  // Headlights OFF
+        else if (comanda == 20) { // Left Signal ON (timed)
+          blinkCounterDreapta = 0; 
+          digitalWrite(PIN_SEMNAL_DR, LOW);
+          blinkCounterStanga = 8; 
+          stareLedStanga = true; 
+          digitalWrite(PIN_SEMNAL_ST, HIGH); 
+          lastBlinkTime = millis();
+        }
+        else if (comanda == 21) { blinkCounterStanga = 0; digitalWrite(PIN_SEMNAL_ST, LOW); }
+        else if (comanda == 30) { // Right Signal ON (timed)
+          blinkCounterStanga = 0; 
+          digitalWrite(PIN_SEMNAL_ST, LOW);
+          blinkCounterDreapta = 8; 
+          stareLedDreapta = true; 
+          digitalWrite(PIN_SEMNAL_DR, HIGH); 
+          lastBlinkTime = millis();
+        }
+        else if (comanda == 31) { blinkCounterDreapta = 0; digitalWrite(PIN_SEMNAL_DR, LOW); }
+      }
+    }
+  }
+
+  // 2. BLINKER LOGIC (Signal or Hazard)
+  if (millis() - lastBlinkTime > VITEZA_SEMNAL) {
+    lastBlinkTime = millis();
+
+    if (modAvarii) {
+      // Synchronous blink for all front lights in Hazard Mode
+      stareLedStanga = !stareLedStanga; 
+      digitalWrite(PIN_FARURI, stareLedStanga);
+      digitalWrite(PIN_SEMNAL_ST, stareLedStanga);
+      digitalWrite(PIN_SEMNAL_DR, stareLedStanga);
+    } 
+    else {
+      // Independent asynchronous signaling logic
+      if (blinkCounterStanga > 0) {
+        blinkCounterStanga--;
+        if(blinkCounterStanga > 0) { 
+          stareLedStanga = !stareLedStanga; 
+          digitalWrite(PIN_SEMNAL_ST, stareLedStanga); 
+        } else {
+          digitalWrite(PIN_SEMNAL_ST, LOW);
+        }
+      }
+      if (blinkCounterDreapta > 0) {
+        blinkCounterDreapta--;
+        if(blinkCounterDreapta > 0) { 
+          stareLedDreapta = !stareLedDreapta; 
+          digitalWrite(PIN_SEMNAL_DR, stareLedDreapta); 
+        } else {
+          digitalWrite(PIN_SEMNAL_DR, LOW);
+        }
+      }
+    }
+  }
+
+  // 3. TEMPERATURE SENSING (DS18B20)
+  if (millis() - lastTempTime > 1000) {
+    float t = sensors.getTempCByIndex(0);
+    if (t > -100) tempDeTrimis = (int)t; // Filter out error readings
+    sensors.requestTemperatures();       // Trigger next reading
+    lastTempTime = millis();
+  }
+
+  // 4. ULTRASONIC DISTANCE & TELEMETRY UPLINK
+  if (millis() - lastDistTime > 50) {
+    // Trigger HC-SR04 pulse
+    digitalWrite(PIN_TRIG, LOW); delayMicroseconds(2);
+    digitalWrite(PIN_TRIG, HIGH); delayMicroseconds(10);
+    digitalWrite(PIN_TRIG, LOW);
+    
+    // Calculate distance based on pulse duration (15ms timeout)
+    long duration = pulseIn(PIN_ECHO, HIGH, 15000); 
+    int dist = duration * 0.034 / 2;
+    if (dist <= 0 || dist > 255) dist = 255; // Out of range handling
+
+    // Send data to Master Controller via CAN
+    CAN.beginPacket(0x02); // ID 0x02 identified as Front Node data
+    CAN.write(dist);          
+    CAN.write(tempDeTrimis);  
+    CAN.endPacket();
+
+    lastDistTime = millis();
+  }
+}
